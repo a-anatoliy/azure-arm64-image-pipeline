@@ -1,0 +1,11 @@
+# {{ ansible_managed }}
+# Changes to accounts and privileges
+-w /etc/passwd -p wa -k identity
+-w /etc/group -p wa -k identity
+-w /etc/shadow -p wa -k identity
+-w /etc/gshadow -p wa -k identity
+-w /etc/sudoers -p wa -k privilege
+-w /etc/sudoers.d/ -p wa -k privilege
+# Changes to SSH configuration
+-w /etc/ssh/sshd_config -p wa -k sshd
+-w /etc/ssh/sshd_config.d/ -p wa -k sshd

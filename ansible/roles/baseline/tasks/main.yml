@@ -1,0 +1,102 @@
+---
+- name: Check the target platform
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['distribution'] == 'Ubuntu'
+      - ansible_facts['distribution_major_version'] | int >= 22
+      - (not (baseline_require_arm64 | bool)) or ansible_facts['architecture'] == 'aarch64'
+    fail_msg: >-
+      Unsupported platform: {{ ansible_facts['distribution'] }}
+      {{ ansible_facts['distribution_version'] }} {{ ansible_facts['architecture'] }}
+
+- name: Upgrade all packages
+  ansible.builtin.apt:
+    update_cache: true
+    upgrade: dist
+    cache_valid_time: 3600
+  when: baseline_upgrade | bool
+
+- name: Install baseline packages
+  ansible.builtin.apt:
+    name: "{{ baseline_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Enable automatic security updates
+  ansible.builtin.copy:
+    dest: /etc/apt/apt.conf.d/20auto-upgrades
+    content: |
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Unattended-Upgrade "1";
+      APT::Periodic::AutocleanInterval "7";
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Harden the SSH daemon
+  ansible.builtin.template:
+    src: sshd_baseline.conf.j2
+    # sshd uses the first value it reads, and drop-ins are read in name order,
+    # so "10-" takes precedence over the cloud image's "50-cloudimg-settings.conf".
+    dest: /etc/ssh/sshd_config.d/10-baseline.conf
+    owner: root
+    group: root
+    mode: "0600"
+  notify: Restart ssh
+
+- name: Ensure the sshd privilege separation directory exists
+  # Normally created when ssh.service starts; with socket activation it may
+  # not exist yet, and "sshd -t" refuses to run without it.
+  ansible.builtin.file:
+    path: /run/sshd
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Validate the SSH daemon configuration
+  ansible.builtin.command: /usr/sbin/sshd -t
+  changed_when: false
+
+- name: Apply kernel hardening settings
+  ansible.builtin.template:
+    src: sysctl_baseline.conf.j2
+    dest: /etc/sysctl.d/60-baseline.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload sysctl
+
+- name: Install audit rules
+  ansible.builtin.template:
+    src: audit_baseline.rules.j2
+    dest: /etc/audit/rules.d/50-baseline.rules
+    owner: root
+    group: root
+    mode: "0640"
+  notify: Load audit rules
+
+- name: Enable baseline services
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+  loop:
+    - auditd
+    - chrony
+  when: baseline_manage_services | bool
+
+- name: Write image metadata
+  ansible.builtin.template:
+    src: image-release.j2
+    dest: /etc/image-release
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Remove packages that are no longer needed
+  ansible.builtin.apt:
+    autoremove: true
+    clean: true
+  when: baseline_upgrade | bool

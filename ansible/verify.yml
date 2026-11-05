@@ -1,0 +1,62 @@
+---
+# Checks that the baseline was applied. Used by CI after running playbook.yml.
+- name: Verify the image baseline
+  hosts: all
+  become: true
+  vars:
+    verify_runtime: true
+  tasks:
+    - name: Read image metadata
+      ansible.builtin.slurp:
+        src: /etc/image-release
+      register: verify_release
+
+    - name: Check image metadata
+      ansible.builtin.assert:
+        that:
+          - "'IMAGE_VERSION=' in (verify_release.content | b64decode)"
+          - "'ARCHITECTURE=' in (verify_release.content | b64decode)"
+
+    - name: Gather installed packages
+      ansible.builtin.package_facts:
+
+    - name: Check baseline packages
+      ansible.builtin.assert:
+        that: item in ansible_facts.packages
+        quiet: true
+      loop: [auditd, chrony, openssh-server, unattended-upgrades]
+
+    - name: Read effective SSH daemon settings
+      ansible.builtin.command: /usr/sbin/sshd -T
+      register: verify_sshd
+      changed_when: false
+
+    - name: Check SSH hardening
+      ansible.builtin.assert:
+        that:
+          - "'permitrootlogin no' in verify_sshd.stdout_lines"
+          - "'passwordauthentication no' in verify_sshd.stdout_lines"
+          - "'x11forwarding no' in verify_sshd.stdout_lines"
+          - "'maxauthtries 3' in verify_sshd.stdout_lines"
+
+    - name: Read runtime kernel settings
+      ansible.builtin.command: sysctl -n kernel.randomize_va_space net.ipv4.conf.all.accept_redirects net.ipv4.tcp_syncookies
+      register: verify_sysctl
+      changed_when: false
+      when: verify_runtime | bool
+
+    - name: Check runtime kernel settings
+      ansible.builtin.assert:
+        that: verify_sysctl.stdout_lines == ['2', '0', '1']
+      when: verify_runtime | bool
+
+    - name: Gather service state
+      ansible.builtin.service_facts:
+      when: verify_runtime | bool
+
+    - name: Check that baseline services are running
+      ansible.builtin.assert:
+        that: ansible_facts.services[item ~ '.service'].state == 'running'
+        quiet: true
+      loop: [auditd, chrony]
+      when: verify_runtime | bool

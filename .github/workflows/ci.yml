@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  PACKER_VERSION: "1.11.2"
+  TERRAFORM_VERSION: "1.9.8"
+
+jobs:
+  lint:
+    name: Lint and validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The Packer Ansible provisioner needs ansible-playbook on PATH
+      # even for "packer validate".
+      - name: Install Ansible and ansible-lint
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet ansible-core ansible-lint
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+
+      - name: Set up Packer
+        uses: hashicorp/setup-packer@main
+        with:
+          version: ${{ env.PACKER_VERSION }}
+
+      - name: Packer fmt and validate
+        run: |
+          packer init packer/
+          packer fmt -check -recursive packer/
+          packer validate -var-file=packer/ci.pkrvars.hcl packer/
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Terraform fmt and validate
+        run: |
+          terraform -chdir=terraform fmt -check -recursive
+          terraform -chdir=terraform init -backend=false -input=false
+          terraform -chdir=terraform validate
+
+      - name: ansible-lint
+        run: ansible-lint
+
+      - name: shellcheck
+        run: |
+          shellcheck -s sh scripts/trivy-scan.sh
+          shellcheck scripts/vm-checks.sh scripts/smoke-test.sh scripts/cleanup-image-versions.sh
+
+  role-test:
+    name: Ansible role on ARM64
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Ansible
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q ansible-core
+
+      - name: Apply the baseline
+        working-directory: ansible
+        run: >
+          ansible-playbook -i localhost, -c local playbook.yml
+          -e baseline_upgrade=false -e baseline_image_version=ci-${{ github.run_number }}
+
+      - name: Verify
+        working-directory: ansible
+        run: ansible-playbook -i localhost, -c local verify.yml
+
+      - name: Idempotence
+        working-directory: ansible
+        run: |
+          ansible-playbook -i localhost, -c local playbook.yml \
+            -e baseline_upgrade=false -e baseline_image_version=ci-${{ github.run_number }} | tee second-run.log
+          grep -Eq 'changed=0 +unreachable=0 +failed=0' second-run.log

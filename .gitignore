@@ -1,0 +1,14 @@
+# Terraform
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/terraform.tfvars
+crash.log
+
+# Packer
+packer_cache/
+reports/
+
+# Ansible
+*.retry
+ansible/second-run.log

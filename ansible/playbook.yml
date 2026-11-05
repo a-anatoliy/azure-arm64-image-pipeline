@@ -1,0 +1,6 @@
+---
+- name: Apply the image baseline
+  hosts: all
+  become: true
+  roles:
+    - baseline

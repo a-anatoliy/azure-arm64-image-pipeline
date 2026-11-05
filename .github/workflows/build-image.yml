@@ -1,0 +1,135 @@
+name: Build image
+
+on:
+  workflow_dispatch:
+    inputs:
+      smoke_test:
+        description: Boot a test VM and promote the version if checks pass
+        type: boolean
+        default: true
+      fail_on_critical:
+        description: Fail the build on fixable CRITICAL vulnerabilities
+        type: boolean
+        default: false
+  # Weekly rebuild picks up security updates. Each run costs money,
+  # so enable it only when you want it.
+  # schedule:
+  #   - cron: "17 4 * * 1"
+
+permissions:
+  id-token: write # OIDC token for azure/login
+  contents: read
+
+concurrency:
+  group: build-image
+  cancel-in-progress: false
+
+env:
+  PACKER_VERSION: "1.11.2"
+  AZURE_LOCATION: ${{ vars.AZURE_LOCATION }}
+  GALLERY_RESOURCE_GROUP: ${{ vars.GALLERY_RESOURCE_GROUP }}
+  BUILD_RESOURCE_GROUP: ${{ vars.BUILD_RESOURCE_GROUP }}
+  GALLERY_NAME: ${{ vars.GALLERY_NAME }}
+  IMAGE_DEFINITION: ${{ vars.IMAGE_DEFINITION }}
+
+jobs:
+  build:
+    name: Build and publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      image_version: ${{ steps.version.outputs.image_version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Image version (YYYY.MMDD.RUN)
+        id: version
+        run: |
+          version="$(date -u +%Y).$((10#$(date -u +%m%d))).${GITHUB_RUN_NUMBER}"
+          echo "image_version=$version" >> "$GITHUB_OUTPUT"
+          echo "### Image version: \`$version\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Set up Packer
+        uses: hashicorp/setup-packer@main
+        with:
+          version: ${{ env.PACKER_VERSION }}
+
+      - name: Install Ansible
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet ansible-core
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+
+      - name: Packer build
+        env:
+          PKR_VAR_subscription_id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          PKR_VAR_location: ${{ vars.AZURE_LOCATION }}
+          PKR_VAR_build_resource_group: ${{ vars.BUILD_RESOURCE_GROUP }}
+          PKR_VAR_gallery_resource_group: ${{ vars.GALLERY_RESOURCE_GROUP }}
+          PKR_VAR_gallery_name: ${{ vars.GALLERY_NAME }}
+          PKR_VAR_image_definition: ${{ vars.IMAGE_DEFINITION }}
+          PKR_VAR_image_version: ${{ steps.version.outputs.image_version }}
+          PKR_VAR_git_sha: ${{ github.sha }}
+          PKR_VAR_fail_on_critical: ${{ inputs.fail_on_critical || false }}
+        run: |
+          mkdir -p reports
+          packer init packer/
+          packer build -color=false -timestamp-ui packer/
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-${{ steps.version.outputs.image_version }}-reports
+          path: reports/
+          if-no-files-found: ignore
+
+  smoke-test:
+    name: Smoke test and promote
+    needs: build
+    if: github.event_name != 'workflow_dispatch' || inputs.smoke_test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Boot a VM from the new version and run checks
+        env:
+          IMAGE_VERSION: ${{ needs.build.outputs.image_version }}
+          SMOKE_TEST_SUBNET_ID: ${{ vars.SMOKE_TEST_SUBNET_ID }}
+        run: scripts/smoke-test.sh
+
+  cleanup:
+    name: Remove old image versions
+    needs: [build, smoke-test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Keep the three newest promoted versions
+        env:
+          KEEP_VERSIONS: "3"
+          CURRENT_VERSION: ${{ needs.build.outputs.image_version }}
+        run: scripts/cleanup-image-versions.sh
